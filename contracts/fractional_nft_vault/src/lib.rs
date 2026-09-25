@@ -47,7 +47,17 @@ pub enum DataKey {
     Finalized,
     NftLocked,
     PayoutClaimed(Address),
+    /// SEP-0029 secondary-sale royalty cut, in basis points.
+    RoyaltyBps,
+    /// Address that receives the royalty cut on a buyout sale.
+    RoyaltyRecipient,
+    /// Soulbound / non-transferable flag for fractional shares.
+    Soulbound,
 }
+
+/// Cap on the configurable royalty cut: 50% (5_000 bps).
+pub const MAX_ROYALTY_BPS: u32 = 5_000;
+pub const BPS_DENOMINATOR: i128 = 10_000;
 
 /// Live buyout auction state.
 #[contracttype]
@@ -79,6 +89,8 @@ pub enum VaultError {
     NoShares = 11,
     ShareMismatch = 12,
     NftNotLocked = 13,
+    RoyaltyTooHigh = 14,
+    SoulboundNonTransferable = 15,
 }
 
 #[contract]
@@ -125,6 +137,59 @@ impl FractionalNftVaultContract {
         env.storage().instance().set(&DataKey::Treasury, &0i128);
         env.storage().instance().set(&DataKey::Finalized, &false);
         env.storage().instance().set(&DataKey::NftLocked, &false);
+        env.storage().instance().set(&DataKey::RoyaltyBps, &0u32);
+        env.storage()
+            .instance()
+            .set(&DataKey::RoyaltyRecipient, &admin);
+        // Fractional shares are freely transferable by default; the admin
+        // can opt into soulbound (non-transferable) mode explicitly.
+        env.storage().instance().set(&DataKey::Soulbound, &false);
+    }
+
+    /// Set the SEP-0029 secondary-sale royalty cut (in basis points) and
+    /// the address that receives it. Admin only.
+    pub fn set_royalty(env: Env, admin: Address, royalty_bps: u32, recipient: Address) {
+        ensure_initialized(&env);
+        admin.require_auth();
+        require_admin(&env, &admin);
+
+        if royalty_bps > MAX_ROYALTY_BPS {
+            panic_with_error!(&env, VaultError::RoyaltyTooHigh);
+        }
+
+        env.storage()
+            .instance()
+            .set(&DataKey::RoyaltyBps, &royalty_bps);
+        env.storage()
+            .instance()
+            .set(&DataKey::RoyaltyRecipient, &recipient);
+    }
+
+    pub fn royalty_bps(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RoyaltyBps)
+            .unwrap_or(0)
+    }
+
+    /// Mark fractional shares as soulbound (non-transferable). Admin only,
+    /// and — matching the soulbound spec — this is a one-way switch: once
+    /// set it cannot be cleared again.
+    pub fn set_soulbound(env: Env, admin: Address, soulbound: bool) {
+        ensure_initialized(&env);
+        admin.require_auth();
+        require_admin(&env, &admin);
+
+        let already: bool = read_bool(&env, DataKey::Soulbound);
+        if already && !soulbound {
+            panic_with_error!(&env, VaultError::SoulboundNonTransferable);
+        }
+
+        env.storage().instance().set(&DataKey::Soulbound, &soulbound);
+    }
+
+    pub fn is_soulbound(env: Env) -> bool {
+        read_bool(&env, DataKey::Soulbound)
     }
 
     /// Lock the NFT into the vault and mint `total_shares` fractional
@@ -197,6 +262,10 @@ impl FractionalNftVaultContract {
         ensure_initialized(&env);
         ensure_not_finalized(&env);
         from.require_auth();
+
+        if read_bool(&env, DataKey::Soulbound) {
+            panic_with_error!(&env, VaultError::SoulboundNonTransferable);
+        }
 
         if shares <= 0 {
             panic_with_error!(&env, VaultError::InvalidAmount);
@@ -331,10 +400,33 @@ impl FractionalNftVaultContract {
             .clone()
             .unwrap_or_else(|| panic_with_error!(&env, VaultError::NoBids));
 
-        // Winner's escrowed bid becomes the treasury; NFT goes to the winner.
+        // A buyout is a secondary sale of the underlying NFT: route the
+        // SEP-0029 royalty cut to the creator before crediting the
+        // remaining proceeds to the share-holder treasury.
+        let royalty_bps: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RoyaltyBps)
+            .unwrap_or(0);
+        let royalty_cut = (auction.current_bid * royalty_bps as i128) / BPS_DENOMINATOR;
+        let treasury_amount = auction.current_bid - royalty_cut;
+
+        if royalty_cut > 0 {
+            let recipient: Address = env
+                .storage()
+                .instance()
+                .get(&DataKey::RoyaltyRecipient)
+                .unwrap_or_else(|| read_admin(&env));
+            token::Client::new(&env, &read_payment_token(&env)).transfer(
+                &env.current_contract_address(),
+                &recipient,
+                &royalty_cut,
+            );
+        }
+
         env.storage()
             .instance()
-            .set(&DataKey::Treasury, &auction.current_bid);
+            .set(&DataKey::Treasury, &treasury_amount);
         env.storage().instance().set(&DataKey::Finalized, &true);
         env.storage().instance().set(&DataKey::NftLocked, &false);
 
@@ -831,6 +923,57 @@ mod tests {
         v.client().start_auction(&v.admin, &1_000, &100);
         v.client().bid(&v.bidder, &5_000);
         v.client().finalize_buyout(&v.bidder);
+    }
+
+    #[test]
+    fn secondary_sale_routes_royalty_cut_to_creator() {
+        let v = setup();
+        fractionalize(&v, 300, 200, 500);
+
+        let creator = Address::generate(&v.env);
+        // 10% royalty on every secondary (buyout) sale.
+        v.client().set_royalty(&v.admin, &1_000u32, &creator);
+        assert_eq!(v.client().royalty_bps(), 1_000);
+
+        v.client().start_auction(&v.admin, &1_000, &100);
+        v.client().bid(&v.bidder, &8_000);
+        v.env.ledger().with_mut(|li| li.timestamp += 101);
+        v.client().finalize_buyout(&v.bidder);
+
+        let sac = token::StellarAssetClient::new(&v.env, &v.payment_token);
+        // 10% of 8000 == 800 routed to the creator.
+        assert_eq!(sac.balance(&creator), 800);
+        // Remaining 7200 becomes the share-holder treasury.
+        assert_eq!(v.client().treasury(), 7_200);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #14)")]
+    fn royalty_above_cap_is_rejected() {
+        let v = setup();
+        let creator = Address::generate(&v.env);
+        v.client()
+            .set_royalty(&v.admin, &(MAX_ROYALTY_BPS + 1), &creator);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #15)")]
+    fn soulbound_shares_reject_transfer_attempts() {
+        let v = setup();
+        fractionalize(&v, 300, 200, 500);
+
+        v.client().set_soulbound(&v.admin, &true);
+        assert!(v.client().is_soulbound());
+
+        v.client().transfer_shares(&v.user_a, &v.user_b, &100);
+    }
+
+    #[test]
+    #[should_panic(expected = "Error(Contract, #15)")]
+    fn soulbound_flag_cannot_be_unset_once_set() {
+        let v = setup();
+        v.client().set_soulbound(&v.admin, &true);
+        v.client().set_soulbound(&v.admin, &false);
     }
 
     #[test]
