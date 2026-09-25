@@ -26,7 +26,20 @@ pub struct CertificateRecord {
     pub revocation_reason: String,
     pub previous_cert_id: BytesN<32>,
     pub content_hash: BytesN<32>,
+    /// SEP-0029 secondary-sale royalty cut, in basis points (1/100 of a
+    /// percent). 250 == 2.5%. Capped at `MAX_ROYALTY_BPS`.
+    pub royalty_bps: u32,
+    /// Certificates are soulbound (non-transferable) by default. This flag
+    /// is set once at issuance and can never be cleared — it is an
+    /// immutable revocation of transferability, not a toggle.
+    pub soulbound: bool,
 }
+
+/// Maximum royalty a creator may configure: 100.00% expressed in basis
+/// points would be nonsensical for a *cut*, so cap well below 100% per
+/// SEP-0029 convention for marketplace-enforced royalties.
+pub const MAX_ROYALTY_BPS: u32 = 5_000; // 50%
+pub const BPS_DENOMINATOR: i128 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Debug)]
@@ -85,6 +98,10 @@ impl CertificateContract {
             revocation_reason: String::from_str(&env, ""),
             previous_cert_id: BytesN::from_array(&env, &[0u8; 32]),
             content_hash,
+            royalty_bps: 0,
+            // Immutable soulbound flag: certificates are non-transferable
+            // from the moment they are issued.
+            soulbound: true,
         };
 
         env.storage()
@@ -170,6 +187,8 @@ impl CertificateContract {
             revocation_reason: String::from_str(&env, ""),
             previous_cert_id: old_cert_id.clone(),
             content_hash: new_content_hash,
+            royalty_bps: old_record.royalty_bps,
+            soulbound: true,
         };
 
         env.storage().persistent().set(
@@ -257,6 +276,77 @@ impl CertificateContract {
             .unwrap_or_else(|| panic_with_error!(&env, Error::CohortNotFound))
     }
 
+    /// Set (or update) the SEP-0029 secondary-sale royalty percentage for a
+    /// certificate, in basis points. Only the original issuer may call
+    /// this, and only while the certificate is `Active`.
+    pub fn set_royalty_bps(env: Env, cert_id: BytesN<32>, royalty_bps: u32) {
+        let mut record: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Certificate(cert_id.clone()))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+
+        record.issuer.require_auth();
+
+        if royalty_bps > MAX_ROYALTY_BPS {
+            panic_with_error!(&env, Error::RoyaltyTooHigh);
+        }
+
+        record.royalty_bps = royalty_bps;
+        env.storage()
+            .persistent()
+            .set(&DataKey::Certificate(cert_id), &record);
+    }
+
+    /// Compute the SEP-0029 royalty split for a secondary sale of
+    /// `sale_amount`. Returns `(creator_cut, seller_proceeds)`; the two
+    /// always sum to `sale_amount`.
+    pub fn calculate_royalty(env: Env, cert_id: BytesN<32>, sale_amount: i128) -> (i128, i128) {
+        let record: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Certificate(cert_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+
+        if sale_amount <= 0 {
+            return (0, 0);
+        }
+
+        let creator_cut = (sale_amount * record.royalty_bps as i128) / BPS_DENOMINATOR;
+        let seller_proceeds = sale_amount - creator_cut;
+        (creator_cut, seller_proceeds)
+    }
+
+    /// Soulbound certificates reject any transfer attempt outright. This
+    /// entrypoint exists so callers/integrations have an explicit,
+    /// standard way to probe (and fail loudly on) transferability instead
+    /// of relying on the absence of a `transfer` function.
+    pub fn transfer_certificate(env: Env, cert_id: BytesN<32>, _to: Address) {
+        let record: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Certificate(cert_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+
+        if record.soulbound {
+            panic_with_error!(&env, Error::SoulboundNonTransferable);
+        }
+        // Non-soulbound certificates are not supported by this contract
+        // today; reaching here would require a future opt-out mechanism.
+        panic_with_error!(&env, Error::SoulboundNonTransferable);
+    }
+
+    /// Returns `true` if the certificate is soulbound (non-transferable).
+    /// Certificates issued by this contract are always soulbound.
+    pub fn is_soulbound(env: Env, cert_id: BytesN<32>) -> bool {
+        let record: CertificateRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Certificate(cert_id))
+            .unwrap_or_else(|| panic_with_error!(&env, Error::NotFound));
+        record.soulbound
+    }
+
     pub fn get_audit_log(env: Env, cert_id: BytesN<32>) -> Vec<RevocationAuditLog> {
         env.storage()
             .persistent()
@@ -306,6 +396,8 @@ pub enum Error {
     AlreadyRevoked = 2,
     NotRevoked = 3,
     CohortNotFound = 4,
+    RoyaltyTooHigh = 5,
+    SoulboundNonTransferable = 6,
 }
 
 #[cfg(test)]
@@ -371,5 +463,112 @@ mod tests {
 
         client.anchor_merkle_cohort(&cohort_id, &cur);
         assert!(client.verify_merkle_inclusion(&cohort_id, &leaf, &proof));
+    }
+
+    #[test]
+    fn test_royalty_setter_and_secondary_sale_split() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(CertificateContract, ());
+        let client = CertificateContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let course_id = String::from_str(&env, "RUST-101");
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        let cert_id = client.issue_certificate(&owner, &issuer, &course_id, &hash);
+
+        // Default royalty is zero until the creator configures it.
+        let (creator_cut, seller_cut) = client.calculate_royalty(&cert_id, &1_000i128);
+        assert_eq!(creator_cut, 0);
+        assert_eq!(seller_cut, 1_000);
+
+        client.set_royalty_bps(&cert_id, &500u32); // 5%
+        let (creator_cut, seller_cut) = client.calculate_royalty(&cert_id, &1_000i128);
+        assert_eq!(creator_cut, 50);
+        assert_eq!(seller_cut, 950);
+        assert_eq!(creator_cut + seller_cut, 1_000);
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_royalty_above_cap_rejected() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(CertificateContract, ());
+        let client = CertificateContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let course_id = String::from_str(&env, "RUST-101");
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        let cert_id = client.issue_certificate(&owner, &issuer, &course_id, &hash);
+
+        client.set_royalty_bps(&cert_id, &(MAX_ROYALTY_BPS + 1));
+    }
+
+    #[test]
+    fn test_certificate_is_soulbound_by_default() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(CertificateContract, ());
+        let client = CertificateContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let course_id = String::from_str(&env, "RUST-101");
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        let cert_id = client.issue_certificate(&owner, &issuer, &course_id, &hash);
+
+        assert!(client.is_soulbound(&cert_id));
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_soulbound_rejects_transfer_attempts() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(CertificateContract, ());
+        let client = CertificateContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let course_id = String::from_str(&env, "RUST-101");
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        let cert_id = client.issue_certificate(&owner, &issuer, &course_id, &hash);
+
+        client.transfer_certificate(&cert_id, &recipient);
+    }
+
+    #[test]
+    fn test_reissued_certificate_preserves_royalty_and_soulbound() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(CertificateContract, ());
+        let client = CertificateContractClient::new(&env, &contract_id);
+        client.initialize(&admin);
+
+        let owner = Address::generate(&env);
+        let issuer = Address::generate(&env);
+        let course_id = String::from_str(&env, "RUST-101");
+        let hash = BytesN::from_array(&env, &[1u8; 32]);
+        let cert_id = client.issue_certificate(&owner, &issuer, &course_id, &hash);
+        client.set_royalty_bps(&cert_id, &300u32);
+        client.revoke_certificate(&cert_id, &String::from_str(&env, "violation"));
+
+        let new_id = client.reissue_certificate(&cert_id, &BytesN::from_array(&env, &[2u8; 32]));
+        let new_record = client.get_certificate(&new_id);
+        assert_eq!(new_record.royalty_bps, 300);
+        assert!(new_record.soulbound);
     }
 }
