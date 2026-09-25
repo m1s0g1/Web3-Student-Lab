@@ -5,7 +5,7 @@ name: Gas Benchmarks & Regression Checks
 # For every pull request touching the contracts workspace we:
 #   1. Measure per-endpoint CPU instruction & memory byte consumption.
 #   2. Compare against the committed baseline snapshot (baselines/…json).
-#   3. Fail the PR if any endpoint regresses by more than 10%.
+#   3. Fail the PR if any endpoint regresses by more than 5% instructions.
 #   4. Post a Markdown comparison report as a PR comment.
 
 on:
@@ -28,7 +28,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  REGRESSION_THRESHOLD: "10"
+  REGRESSION_THRESHOLD: "5"
 
 jobs:
   benchmark:
