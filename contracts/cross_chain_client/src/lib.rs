@@ -560,3 +560,6 @@ impl CrossChainClient {
         }
     }
 }
+
+#[cfg(test)]
+mod test;
