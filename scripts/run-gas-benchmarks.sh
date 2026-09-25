@@ -8,7 +8,7 @@
 #   - a JSON report for machine consumption.
 #
 # Exits non-zero if any endpoint regresses by more than the configured
-# threshold (default 10%).
+# threshold (default 5%).
 #
 # Usage:
 #   ./scripts/run-gas-benchmarks.sh [threshold_pct]
@@ -20,7 +20,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CONTRACTS="$REPO_ROOT/contracts"
-THRESHOLD="${1:-10}"
+THRESHOLD="${1:-5}"
 BASELINE="$CONTRACTS/gas_benchmarks/baselines/soroban_contracts.json"
 REPORT="${GAS_BENCH_REPORT:-$REPO_ROOT/gas_bench_report.json}"
 
